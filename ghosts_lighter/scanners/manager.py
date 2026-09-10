@@ -53,6 +53,8 @@ from ghosts_lighter.crawler.spider import Crawler, BROWSER_AVAILABLE
 from ghosts_lighter.auth.detector import LoginDiscoveryEngine
 from ghosts_lighter.auth.session_auth import AuthSession
 from ghosts_lighter.reporters.engine import ReporterEngine, _get_report_dir
+from ghosts_lighter.scanners.sqli import SQLiScanner
+from ghosts_lighter.scanners.xss import XSSScanner
 
 class AuditoriaMejorada:
     STATIC_EXTENSIONS = ('.css', '.js', '.mjs', '.map', '.json', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico', '.woff', '.woff2', '.ttf', '.eot', '.webp', '.mp4', '.pdf')
@@ -400,70 +402,66 @@ class AuditoriaMejorada:
     def test_xss_reflejado(self):
         try:
             candidatos = self._target_urls_para_inyeccion()
-            payloads = WORDLISTS['security_payloads']['xss'][:4]
-            vulnerables = []
+            scanner = XSSScanner(self.session, timeout=DEFAULT_TIMEOUT)
+            confirmados = []
+            info_reflejos = []
             probadas = 0
+
             for base_url, params in candidatos:
                 for param in list(params)[:6]:
-                    for payload in payloads:
-                        probadas += 1
-                        try:
-                            response = self.session.get(base_url, params={param: payload}, timeout=DEFAULT_TIMEOUT)
-                            if payload in response.text:
-                                vulnerables.append(f"{param} @ {base_url}")
-                                self.add_finding("Inyeccion XSS Reflejado", f"Payload reflejado sin sanitizar en parametro '{param}'", base_url)
-                                break
-                        except Exception:
-                            pass
+                    probadas += 1
+                    try:
+                        hallazgos = scanner.scan_endpoint(base_url, param)
+                        for h in hallazgos:
+                            if h.get('severity') == 'critica':
+                                confirmados.append(f"{param} @ {base_url}")
+                                self.add_finding("Inyeccion XSS Reflejado", h['detalle'], base_url)
+                            else:
+                                info_reflejos.append(f"{param} @ {base_url}")
+                                self.add_finding("Inyeccion XSS Reflejado - No Ejecutable", h['detalle'], base_url)
+                    except Exception:
+                        pass
 
-            if vulnerables:
-                return self.print_result("Inyeccion XSS Reflejado", "FAIL", f"{len(vulnerables)} vulnerables (ej: {vulnerables[0]}) de {probadas} pruebas")
+            if confirmados:
+                return self.print_result("Inyeccion XSS Reflejado", "FAIL", f"{len(confirmados)} vulnerables confirmados (ej: {confirmados[0]}) de {probadas} pruebas")
+            if info_reflejos:
+                return self.print_result("Inyeccion XSS Reflejado", "WARN", f"Reflejo no ejecutable en {len(info_reflejos)} parámetros (ej: {info_reflejos[0]})")
             if probadas == 0:
                 return self.print_result("Inyeccion XSS Reflejado", "SKIP", "Sin endpoints/parametros descubiertos para probar")
-            return self.print_result("Inyeccion XSS Reflejado", "PASS", f"No se detectaron XSS ({probadas} pruebas sobre {len(candidatos)} endpoints)")
+            return self.print_result("Inyeccion XSS Reflejado", "PASS", f"No se detectaron XSS contextuales ({probadas} endpoints probados)")
         except Exception as e:
             return self.print_result("Inyeccion XSS Reflejado", "FAIL", f"Error: {e}")
 
     def test_sql_injection(self):
         try:
             candidatos = self._target_urls_para_inyeccion()
-            payloads = WORDLISTS['security_payloads']['sql'][:6]
-            sql_errors = ['sql syntax', 'mysql_fetch', 'sqlite', 'postgresql', 'oracle', 'syntax error', 'odbc driver']
+            scanner = SQLiScanner(self.session, timeout=DEFAULT_TIMEOUT)
             confirmados = []
             sospechosos = []
             probadas = 0
+
             for base_url, params in candidatos:
                 for param in list(params)[:6]:
-                    baseline_500 = False
+                    probadas += 1
                     try:
-                        baseline = self.session.get(base_url, params={param: 'gl_baseline_check'}, timeout=DEFAULT_TIMEOUT)
-                        baseline_500 = (baseline.status_code == 500)
+                        hallazgos = scanner.scan_endpoint(base_url, param)
+                        for h in hallazgos:
+                            if h.get('severity') == 'critica':
+                                confirmados.append(f"{param} ({h.get('technique', 'SQLi')}) @ {base_url}")
+                                self.add_finding("Inyeccion SQL (SQLi)", h['detalle'], base_url)
+                            else:
+                                sospechosos.append(f"{param} ({h.get('technique', 'SQLi')}) @ {base_url}")
+                                self.add_finding("Inyeccion SQL (SQLi) - Sospecha", h['detalle'], base_url)
                     except Exception:
-                        baseline_500 = True
-
-                    for payload in payloads:
-                        probadas += 1
-                        try:
-                            response = self.session.get(base_url, params={param: payload}, timeout=DEFAULT_TIMEOUT)
-                            cuerpo = response.text.lower()
-                            if any(err in cuerpo for err in sql_errors):
-                                confirmados.append(f"{param} @ {base_url}")
-                                self.add_finding("Inyeccion SQL (SQLi)", f"Firma de error SQL en la respuesta al inyectar en '{param}'", base_url)
-                                break
-                            elif response.status_code == 500 and not baseline_500:
-                                sospechosos.append(f"{param} @ {base_url}")
-                                self.add_finding("Inyeccion SQL (SQLi) - Sospecha", f"Error 500 solo con payload SQL (baseline con valor inocuo respondio OK) en '{param}' - requiere confirmacion manual", base_url)
-                                break
-                        except Exception:
-                            pass
+                        pass
 
             if confirmados:
-                return self.print_result("Inyeccion SQL (SQLi)", "FAIL", f"{len(confirmados)} confirmados por firma de error (ej: {confirmados[0]}) de {probadas} pruebas")
+                return self.print_result("Inyeccion SQL (SQLi)", "FAIL", f"{len(confirmados)} confirmados ({confirmados[0]}) de {probadas} pruebas")
             if sospechosos:
-                return self.print_result("Inyeccion SQL (SQLi)", "WARN", f"{len(sospechosos)} sospechosos sin firma confirmada (ej: {sospechosos[0]}) - revisar manualmente")
+                return self.print_result("Inyeccion SQL (SQLi)", "WARN", f"{len(sospechosos)} sospechosos sin confirmar ({sospechosos[0]}) - revisar")
             if probadas == 0:
                 return self.print_result("Inyeccion SQL (SQLi)", "SKIP", "Sin endpoints/parametros descubiertos para probar")
-            return self.print_result("Inyeccion SQL (SQLi)", "PASS", f"No se detectaron SQLi ({probadas} pruebas sobre {len(candidatos)} endpoints)")
+            return self.print_result("Inyeccion SQL (SQLi)", "PASS", f"No se detectaron SQLi (Error, Boolean y Time-based) en {probadas} pruebas")
         except Exception as e:
             return self.print_result("Inyeccion SQL (SQLi)", "FAIL", f"Error: {e}")
 
