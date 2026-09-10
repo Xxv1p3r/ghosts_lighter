@@ -7,6 +7,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 
 from ghosts_lighter.scanners.sqli import SQLiScanner, SQL_ERROR_PATTERNS
 from ghosts_lighter.scanners.xss import XSSScanner, analyze_reflection_context
+from ghosts_lighter.scanners.traversal import TraversalScanner, check_php_base64_disclosure
 
 
 class MockResponse:
@@ -109,6 +110,55 @@ class TestSQLiAndXSSScanners(unittest.TestCase):
         self.assertGreater(len(findings), 0)
         self.assertEqual(findings[0]['severity'], 'critica')
         self.assertEqual(findings[0]['technique'], 'Error-Based')
+
+    def test_traversal_linux_detection(self):
+        # Endpoint vulnerable a LFI Linux (/etc/passwd)
+        def handler(url, params):
+            val = list(params.values())[0] if params else ""
+            if "etc/passwd" in val:
+                return MockResponse("root:x:0:0:root:/root:/bin/bash\ndaemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin", 200)
+            return MockResponse("Welcome home", 200)
+
+        mock_session = MockSession(handler)
+        scanner = TraversalScanner(mock_session)
+        findings = scanner.scan_endpoint("http://example.local/view", "file")
+        self.assertGreater(len(findings), 0)
+        self.assertEqual(findings[0]['severity'], 'critica')
+        self.assertEqual(findings[0]['target_os'], 'Linux')
+
+    def test_traversal_windows_detection(self):
+        # Endpoint vulnerable a LFI Windows (win.ini)
+        def handler(url, params):
+            val = list(params.values())[0] if params else ""
+            if "win.ini" in val:
+                return MockResponse("; for 16-bit app support\n[fonts]\n[extensions]", 200)
+            return MockResponse("Normal view", 200)
+
+        mock_session = MockSession(handler)
+        scanner = TraversalScanner(mock_session)
+        findings = scanner.scan_endpoint("http://example.local/load", "page")
+        self.assertGreater(len(findings), 0)
+        self.assertEqual(findings[0]['severity'], 'critica')
+        self.assertEqual(findings[0]['target_os'], 'Windows')
+
+    def test_traversal_php_wrapper_detection(self):
+        # Endpoint vulnerable a PHP wrapper Base64 disclosure
+        import base64
+        php_code = "<?php\n$db_pass = 'super_secret_123';\nfunction connect() {}\n?>"
+        encoded_b64 = base64.b64encode(php_code.encode()).decode()
+
+        def handler(url, params):
+            val = list(params.values())[0] if params else ""
+            if "php://filter" in val:
+                return MockResponse(f"File content: {encoded_b64}", 200)
+            return MockResponse("Regular page", 200)
+
+        mock_session = MockSession(handler)
+        scanner = TraversalScanner(mock_session)
+        findings = scanner.scan_endpoint("http://example.local/index.php", "page")
+        self.assertGreater(len(findings), 0)
+        self.assertEqual(findings[0]['severity'], 'critica')
+        self.assertIn("wrapper PHP", findings[0]['detalle'])
 
 
 if __name__ == '__main__':

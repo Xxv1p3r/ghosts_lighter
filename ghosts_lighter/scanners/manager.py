@@ -55,6 +55,7 @@ from ghosts_lighter.auth.session_auth import AuthSession
 from ghosts_lighter.reporters.engine import ReporterEngine, _get_report_dir
 from ghosts_lighter.scanners.sqli import SQLiScanner
 from ghosts_lighter.scanners.xss import XSSScanner
+from ghosts_lighter.scanners.traversal import TraversalScanner, LFI_PARAM_HINTS
 
 class AuditoriaMejorada:
     STATIC_EXTENSIONS = ('.css', '.js', '.mjs', '.map', '.json', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico', '.woff', '.woff2', '.ttf', '.eot', '.webp', '.mp4', '.pdf')
@@ -467,28 +468,29 @@ class AuditoriaMejorada:
 
     def test_path_traversal(self):
         try:
-            payloads = WORDLISTS['security_payloads']['path_traversal']
             candidatos = self._target_urls_para_inyeccion()
-            params_traversal = {'page', 'doc', 'file', 'path', 'view', 'template', 'download'}
+            scanner = TraversalScanner(self.session, timeout=DEFAULT_TIMEOUT)
             vulnerables = []
             probadas = 0
+
             for base_url, params in candidatos:
-                params_a_probar = (params & params_traversal) or {'file'}
-                for param in params_a_probar:
-                    for payload in payloads:
-                        probadas += 1
-                        try:
-                            response = self.session.get(base_url, params={param: payload}, timeout=DEFAULT_TIMEOUT)
-                            if any(key in response.text for key in ('root:x:', 'bin/bash', 'daemon:', '[boot loader]')):
-                                vulnerables.append(f"{param} @ {base_url}")
-                                self.add_finding("Directory / Path Traversal", f"Contenido de sistema expuesto via '{param}'", base_url)
-                                break
-                        except Exception:
-                            pass
+                params_a_probar = (params & LFI_PARAM_HINTS) or (params if params else {'file', 'page'})
+                for param in list(params_a_probar)[:8]:
+                    probadas += 1
+                    try:
+                        hallazgos = scanner.scan_endpoint(base_url, param)
+                        for h in hallazgos:
+                            vulnerables.append(f"{param} ({h.get('technique', 'LFI')}) @ {base_url}")
+                            self.add_finding("Directory / Path Traversal", h['detalle'], base_url)
+                            break
+                    except Exception:
+                        pass
 
             if vulnerables:
-                return self.print_result("Directory / Path Traversal", "FAIL", f"{len(vulnerables)} vulnerables (ej: {vulnerables[0]})")
-            return self.print_result("Directory / Path Traversal", "PASS", f"No se detecto ({probadas} pruebas)")
+                return self.print_result("Directory / Path Traversal", "FAIL", f"{len(vulnerables)} vulnerables confirmados (ej: {vulnerables[0]})")
+            if probadas == 0:
+                return self.print_result("Directory / Path Traversal", "SKIP", "Sin endpoints/parametros para probar inclusión de archivos")
+            return self.print_result("Directory / Path Traversal", "PASS", f"No se detectó LFI ni Traversal en {probadas} parámetros probados")
         except Exception as e:
             return self.print_result("Directory / Path Traversal", "FAIL", f"Error: {e}")
 
