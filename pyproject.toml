@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ghosts-lighter"
+version = "1.0.0"
+description = "GHOSTS LIGHTER - Local, Fast & Actionable Web Security Assessment Engine (OWASP Top 10)"
+readme = "README.md"
+authors = [{ name = "v1p3rx" }]
+license = { text = "MIT" }
+requires-python = ">=3.8"
+dependencies = [
+    "requests>=2.28.0"
+]
+
+[project.optional-dependencies]
+browser = [
+    "playwright>=1.40.0"
+]
+dev = [
+    "pytest>=7.0.0",
+    "responses>=0.23.0",
+    "playwright>=1.40.0"
+]
+
+[project.scripts]
+ghosts-lighter = "ghosts_lighter.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ghosts_lighter*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]

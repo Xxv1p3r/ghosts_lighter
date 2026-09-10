@@ -1,0 +1,5 @@
+# Core dependencies
+requests>=2.28.0
+
+# Optional SPA / Browser rendering (requires `playwright install chromium`)
+# playwright>=1.40.0

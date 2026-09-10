@@ -1,0 +1,31 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Reportes generados por ejecuciones de auditoría
+reporte/
+reports/
+informe_ghosts_lighter_*
+
+# Entornos virtuales
+.venv/
+venv/
+ENV/
+env/
+
+# IDEs y editores
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Testing y cobertura
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Empaquetado y distribución
+dist/
+build/
+*.egg-info/
