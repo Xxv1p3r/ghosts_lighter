@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Gestión de sesiones autenticadas y envío de credenciales.
+Authenticated session management and credential dispatch.
 """
 
 from urllib.parse import urljoin
@@ -28,7 +28,7 @@ class AuthSession:
 
     def attempt_login(self, crawler_forms):
         if not self.username or not self.password:
-            return (False, "No se proporcionaron credenciales (--username/--password)")
+            return (False, "No credentials provided (--username/--password)")
         target_form = None
         if self.login_path:
             try:
@@ -44,7 +44,7 @@ class AuthSession:
             target_form = self._find_login_form(crawler_forms)
 
         if target_form is None:
-            return (False, "No se encontro un formulario de login reconocible")
+            return (False, "No recognizable login form found")
 
         user_hints = WORDLISTS['login_field_hints']['user']
         pass_hints = WORDLISTS['login_field_hints']['pass']
@@ -65,8 +65,8 @@ class AuthSession:
             else:
                 resp = self.session.post(target_form['action'], data=payload, timeout=DEFAULT_TIMEOUT, allow_redirects=True)
             if resp.status_code < 400:
-                return (True, f"Login enviado a {target_form['action']} ({resp.status_code})")
+                return (True, f"Login submitted to {target_form['action']} ({resp.status_code})")
             else:
-                return (False, f"El servidor respondio {resp.status_code} al intentar login")
+                return (False, f"Server responded with {resp.status_code} during login attempt")
         except Exception as e:
-            return (False, f"Error enviando login: {e}")
+            return (False, f"Error submitting login: {e}")

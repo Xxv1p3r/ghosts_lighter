@@ -10,7 +10,7 @@ from .auth.detector import LoginDiscoveryEngine
 from .auth.session_auth import AuthSession
 from .crawler.spider import Crawler, BROWSER_AVAILABLE
 from .reporters.engine import ReporterEngine, _get_report_dir
-from .scanners.manager import AuditoriaMejorada
+from .scanners.manager import AuditoriaMejorada, SecurityAuditEngine, EnhancedAudit
 from .cli import main
 
 __version__ = PRODUCT_VERSION
@@ -29,5 +29,7 @@ __all__ = [
     'ReporterEngine',
     '_get_report_dir',
     'AuditoriaMejorada',
+    'SecurityAuditEngine',
+    'EnhancedAudit',
     'main'
 ]

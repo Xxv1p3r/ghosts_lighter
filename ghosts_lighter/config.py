@@ -45,12 +45,15 @@ PRODUCT_NAME = 'GHOSTS LIGHTER'
 PRODUCT_VERSION = '1.0.0'
 
 BANNER = """
- ██████╗ ██╗  ██╗ ██████╗ ████████╗███████╗███████╗
-██╔════╝ ██║  ██║██╔═══██╗╚══██╔══╝██╔════╝██╔════╝
-██║  ███╗███████║██║   ██║   ██║   ███████╗███████╗
-██║   ██║██╔══██║██║   ██║   ██║   ╚════██║╚════██║
-╚██████╔╝██║  ██║╚██████╔╝   ██║   ███████║███████║
- ╚═════╝ ╚═╝  ╚═╝ ╚═════╝    ╚═╝   ╚══════╝╚══════╝
+  ▄████  ██░ ██  ▒█████    ██████ ▄▄▄█████▓  ██████ 
+ ██▒ ▀█▒▓██░ ██▒▒██▒  ██▒▒██    ▒ ▓  ██▒ ▓▒▒██    ▒ 
+▒██░▄▄▄░▒██▀▀██░▒██░  ██▒░ ▓██▄   ▒ ▓██░ ▒░░ ▓██▄   
+░▓█  ██▓░▓█ ░██ ▒██   ██░  ▒   ██▒░ ▓██▓ ░   ▒   ██▒
+░▒▓███▀▒░▓█▒░██▓░ ████▓▒░▒██████▒▒  ▒██▒ ░ ▒██████▒▒
+ ░▒   ▒  ▒ ░░▒░▒░ ▒░▒░▒░ ▒ ▒▓▒ ▒ ░  ▒ ░░   ▒ ▒▓▒ ▒ ░
+  ░   ░  ▒ ░▒░ ░  ░ ▒ ▒░ ░ ░▒  ░ ░    ░    ░ ░▒  ░ ░
+░ ░   ░  ░  ░░ ░░ ░ ░ ▒  ░  ░  ░    ░      ░  ░  ░  
+      ░  ░  ░  ░    ░ ░        ░                 ░  
 
        L I G H T E R  ·  Assessment Engine
 
@@ -101,6 +104,22 @@ JS_PATTERNS = {
 
 MAX_JS_BUNDLE_BYTES = 2097152
 MAX_JS_BUNDLES = 40
+
+# Secretos HMAC habituales en JWT. Si alguno valida la firma de un token, el
+# hallazgo es una prueba criptografica (no una heuristica).
+JWT_WEAK_SECRETS = [
+    'secret', 'secretkey', 'secret_key', 'secret-key', 'mysecret', 'my_secret',
+    'supersecret', 'super_secret', 'jwt', 'jwtsecret', 'jwt_secret', 'jwt-secret',
+    'token', 'tokenkey', 'token_key', 'password', 'password123', 'passw0rd',
+    'changeme', 'change-me', 'admin', 'administrator', 'default', 'test',
+    'testing', 'dev', 'development', 'production', 'staging', 'demo',
+    'example', 'sample', 'key', 'privatekey', 'private_key', 'apikey',
+    'api_key', 'auth', 'authentication', 'authkey', 'hmac', 'hmackey',
+    'signature', 'signingkey', 's3cr3t', '123456', '12345678', '1234567890',
+    'qwerty', 'letmein', 'welcome', 'root', 'toor', 'abc123',
+    'your-256-bit-secret', 'your-secret-key', 'topsecret', 'top_secret',
+    'blahblah', 'iloveyou', 'monkey', 'dragon', 'master', 'sunshine',
+]
 WORDLISTS = {   'api_endpoints': [   '/api',
                          '/api/v1',
                          '/api/v2',
@@ -442,6 +461,15 @@ TEST_METADATA = {   'API Discovery': {   'grupo': 'Auditoria Avanzada',
                                           'owasp': 'A02:2025 - Security '
                                                    'Misconfiguration',
                                           'severidad': 'baja'},
+    'Auditoria JWT': {   'grupo': 'Seguridad OWASP Top 10',
+                         'owasp': 'A07:2025 - Identification and Authentication Failures',
+                         'severidad': 'critica'},
+    'Auditoria IDOR (Doble Sesion)': {   'grupo': 'Seguridad OWASP Top 10',
+                                         'owasp': 'A01:2025 - Broken Access Control',
+                                         'severidad': 'critica'},
+    'Bypass de 403': {   'grupo': 'Seguridad OWASP Top 10',
+                         'owasp': 'A01:2025 - Broken Access Control',
+                         'severidad': 'critica'},
     'Calibracion Soft-404': {   'grupo': 'Auditoria Avanzada',
                                 'owasp': 'General',
                                 'severidad': 'info'},
@@ -465,6 +493,9 @@ TEST_METADATA = {   'API Discovery': {   'grupo': 'Auditoria Avanzada',
                                         'owasp': 'A02:2025 - Security '
                                                  'Misconfiguration',
                                         'severidad': 'critica'},
+    'GraphQL Introspection': {   'grupo': 'Seguridad OWASP Top 10',
+                                 'owasp': 'A02:2025 - Security Misconfiguration',
+                                 'severidad': 'media'},
     'HTTPS Obligatorio': {   'grupo': 'Seguridad OWASP Top 10',
                              'owasp': 'A04:2025 - Cryptographic Failures',
                              'severidad': 'alta'},
@@ -483,10 +514,28 @@ TEST_METADATA = {   'API Discovery': {   'grupo': 'Auditoria Avanzada',
     'JS Static Analysis': {   'grupo': 'Auditoria Avanzada',
                               'owasp': 'A02:2025 - Security Misconfiguration',
                               'severidad': 'alta'},
+    'JWT Claims Sensibles': {   'grupo': 'Seguridad OWASP Top 10',
+                                'owasp': 'A07:2025 - Identification and Authentication Failures',
+                                'severidad': 'media'},
+    'JWT Firma No Validada': {   'grupo': 'Seguridad OWASP Top 10',
+                                 'owasp': 'A07:2025 - Identification and Authentication Failures',
+                                 'severidad': 'critica'},
+    'JWT Secreto HMAC Debil': {   'grupo': 'Seguridad OWASP Top 10',
+                                  'owasp': 'A07:2025 - Identification and Authentication Failures',
+                                  'severidad': 'critica'},
+    'JWT Sin Expiracion': {   'grupo': 'Seguridad OWASP Top 10',
+                              'owasp': 'A07:2025 - Identification and Authentication Failures',
+                              'severidad': 'baja'},
+    'JWT Sin Firma (alg none)': {   'grupo': 'Seguridad OWASP Top 10',
+                                    'owasp': 'A07:2025 - Identification and Authentication Failures',
+                                    'severidad': 'critica'},
     'Login / Autenticacion': {   'grupo': 'Seguridad OWASP Top 10',
                                  'owasp': 'A07:2025 - Identification and '
                                           'Authentication Failures',
                                  'severidad': 'alta'},
+    'OS Command Injection': {   'grupo': 'Seguridad OWASP Top 10',
+                                 'owasp': 'A05:2025 - Injection',
+                                 'severidad': 'critica'},
     'Open Redirect Inseguro': {   'grupo': 'Seguridad OWASP Top 10',
                                   'owasp': 'A07:2025 - Identification and '
                                            'Authentication Failures',
@@ -500,6 +549,15 @@ TEST_METADATA = {   'API Discovery': {   'grupo': 'Auditoria Avanzada',
     'SPA Discovery': {   'grupo': 'Auditoria Avanzada',
                          'owasp': 'General',
                          'severidad': 'info'},
+    'SSRF / Cloud Metadata': {   'grupo': 'Seguridad OWASP Top 10',
+                                 'owasp': 'A01:2025 - Broken Access Control',
+                                 'severidad': 'critica'},
+    'SSRF - Sospecha': {   'grupo': 'Seguridad OWASP Top 10',
+                           'owasp': 'A01:2025 - Broken Access Control',
+                           'severidad': 'media'},
+    'SSTI (Template Injection)': {   'grupo': 'Seguridad OWASP Top 10',
+                                      'owasp': 'A05:2025 - Injection',
+                                      'severidad': 'critica'},
     'Tech Detection': {   'grupo': 'Auditoria Avanzada',
                           'owasp': 'General',
                           'severidad': 'info'}}

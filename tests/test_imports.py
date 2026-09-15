@@ -39,10 +39,31 @@ class TestImports(unittest.TestCase):
 
     def test_cli_parser(self):
         parser = build_parser()
-        args = parser.parse_args(['http://localhost:3000', '--no-browser', '--max-pages', '10'])
+        args = parser.parse_args(['http://localhost:3000', '--no-browser', '--max-pages', '10', '--username2', 'bob', '--password2', 'secret123'])
         self.assertEqual(args.target_url, 'http://localhost:3000')
         self.assertTrue(args.no_selenium)
         self.assertEqual(args.max_pages, 10)
+        self.assertEqual(args.username2, 'bob')
+        self.assertEqual(args.password2, 'secret123')
+
+    def test_cli_friendly_flags(self):
+        parser = build_parser()
+        args = parser.parse_args([
+            '-u', 'http://example.local:8080',
+            '-a', 'admin:supersecret',
+            '--a2', 'guest:guest123',
+            '-w', 'common.txt',
+            '-f',
+            '-l', '/api/v1/auth',
+            '-o', 'reporte_ctf.html'
+        ])
+        self.assertEqual(args.url, 'http://example.local:8080')
+        self.assertEqual(args.auth, 'admin:supersecret')
+        self.assertEqual(args.auth2, 'guest:guest123')
+        self.assertEqual(args.wl, 'common.txt')
+        self.assertTrue(args.fast)
+        self.assertEqual(args.login_path, '/api/v1/auth')
+        self.assertEqual(args.output, 'reporte_ctf.html')
 
 
 if __name__ == '__main__':

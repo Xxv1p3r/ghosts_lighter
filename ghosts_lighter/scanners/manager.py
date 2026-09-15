@@ -56,11 +56,23 @@ from ghosts_lighter.reporters.engine import ReporterEngine, _get_report_dir
 from ghosts_lighter.scanners.sqli import SQLiScanner
 from ghosts_lighter.scanners.xss import XSSScanner
 from ghosts_lighter.scanners.traversal import TraversalScanner, LFI_PARAM_HINTS
+from ghosts_lighter.scanners.ssrf import SSRFScanner, SSRF_PARAM_HINTS, SSRF_PARAM_PRIORITY
+from ghosts_lighter.scanners.ssti import SSTIScanner, SSTI_PARAM_HINTS
+from ghosts_lighter.scanners.cmdi import CommandInjectionScanner, CMDI_PARAM_HINTS
+from ghosts_lighter.scanners.graphql import GraphQLIntrospectionScanner, GRAPHQL_PATHS
+from ghosts_lighter.scanners.bypass403 import AccessControl403Scanner, SENSITIVE_PROTECTED_PATHS
+from ghosts_lighter.scanners.jwt import JWTScanner, es_jwt, extraer_jwts
+from ghosts_lighter.scanners.idor import (
+    IDORScanner,
+    IDOR_PARAM_HINTS,
+    COMMON_OBJECT_PATHS,
+    REST_ID_PATTERNS
+)
 
 class AuditoriaMejorada:
     STATIC_EXTENSIONS = ('.css', '.js', '.mjs', '.map', '.json', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico', '.woff', '.woff2', '.ttf', '.eot', '.webp', '.mp4', '.pdf')
 
-    def __init__(self, target_url, http_port=None, username=None, password=None, login_path=None, max_pages=40, max_depth=2, no_selenium=False, wordlist_path=None):
+    def __init__(self, target_url, http_port=None, username=None, password=None, login_path=None, max_pages=40, max_depth=2, no_selenium=False, wordlist_path=None, username2=None, password2=None, session_b=None):
         self.target_url = target_url.rstrip('/')
         parsed = urlparse(self.target_url)
         if parsed.scheme not in ('http', 'https'):
@@ -75,6 +87,13 @@ class AuditoriaMejorada:
         self.session.headers.update({'User-Agent': random.choice(WORDLISTS['user_agents'])})
         self.username = username
         self.password = password
+        self.username2 = username2
+        self.password2 = password2
+        self.session_b = session_b if session_b is not None else requests.Session()
+        self.session_b.verify = False
+        self.session_b.headers.update({'User-Agent': random.choice(WORDLISTS['user_agents'])})
+        self.session_b_authenticated = False
+        self.session_b_info = "Sesion B no configurada (Guest)"
         self.login_path = login_path
         self.max_pages = max_pages
         self.max_depth = max_depth
@@ -153,11 +172,11 @@ class AuditoriaMejorada:
             self.soft_404_hash = hashlib.sha256(resp.text.encode('utf-8', errors='ignore')).hexdigest()
             if resp.status_code == 200:
                 self.soft_404_activo = True
-                self.print_result("Calibracion Soft-404", "WARN", "El servidor responde 200 a rutas inexistentes (fallback SPA) - Path Scan y API Discovery filtraran por contenido, no solo status code")
+                self.print_result("Calibracion Soft-404", "WARN", "Server responds with 200 to non-existent paths (SPA fallback) - Path Scan and API Discovery will filter by content")
                 return
-            self.print_result("Calibracion Soft-404", "PASS", f"El servidor responde {resp.status_code} a rutas inexistentes (comportamiento esperado)")
+            self.print_result("Calibracion Soft-404", "PASS", f"Server responds with {resp.status_code} to non-existent paths (expected behavior)")
         except Exception as e:
-            self.print_result("Calibracion Soft-404", "SKIP", f"No se pudo calibrar: {e}")
+            self.print_result("Calibracion Soft-404", "SKIP", f"Could not calibrate: {e}")
 
     def _es_respuesta_real(self, response):
         if not self.soft_404_activo:
@@ -182,6 +201,34 @@ class AuditoriaMejorada:
         parsed = urlparse(url)
         return urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', '', ''))
 
+    def _candidatos_ssrf(self):
+        """Candidatos (url, parametro) priorizando solo nombres que controlan una peticion server-side."""
+        candidatos = []
+        vistos = set()
+
+        def agregar(url, param):
+            clave = (self._strip_query(url), param.lower())
+            if clave in vistos:
+                return
+            vistos.add(clave)
+            candidatos.append((url, param))
+
+        urls = [u for u in (self.crawl_data.get('visited') or [self.target_url]) if not self._es_asset_estatico(u)]
+        query_params = self.crawl_data.get('query_params', {})
+
+        # 1. Parametros reales descubiertos en querystrings (maxima prioridad)
+        for url in urls[:15]:
+            for param in sorted(query_params.get(self._strip_query(url), set())):
+                if param.lower() in SSRF_PARAM_HINTS:
+                    agregar(url, param)
+
+        # 2. Nombres de parametro tipicos de SSRF sobre las URLs descubiertas
+        for url in urls[:8]:
+            for param in SSRF_PARAM_PRIORITY[:6]:
+                agregar(url, param)
+
+        return candidatos
+
     def _target_urls_para_inyeccion(self):
         candidatos = []
         for url in (self.crawl_data['visited'] or [self.target_url]):
@@ -204,6 +251,114 @@ class AuditoriaMejorada:
             candidatos.append((url, set(WORDLISTS['test_parameters'][:6])))
 
         return candidatos[:35]
+
+    def _candidatos_graphql(self):
+        """Candidatos a endpoint GraphQL: rutas comunes + endpoints vistos en crawler y JS."""
+        candidatos = []
+        vistos = set()
+
+        def agregar(url):
+            norm = self._strip_query(url).rstrip('/').lower()
+            if not norm or norm in vistos:
+                return
+            vistos.add(norm)
+            candidatos.append(url)
+
+        for path in GRAPHQL_PATHS:
+            agregar(urljoin(self.target_url + '/', path.lstrip('/')))
+
+        patron_graphql = re.compile(r'graphql|/gql\b|/graphiql', re.I)
+        for endpoint in self.crawl_data.get('js_endpoints', []):
+            if patron_graphql.search(endpoint):
+                agregar(urljoin(self.target_url + '/', endpoint.lstrip('/')))
+
+        for url in self.crawl_data.get('visited', []):
+            if patron_graphql.search(url):
+                agregar(url)
+
+        return candidatos[:12]
+
+    def _candidatos_token(self):
+        """Endpoints que pueden emitir un JWT: los referenciados por la app + rutas comunes."""
+        patron = re.compile(r'token|jwt|auth|session|login|oauth', re.I)
+        candidatos = []
+        vistos = set()
+
+        for endpoint in self.crawl_data.get('js_endpoints', []):
+            if not patron.search(endpoint):
+                continue
+            norm = endpoint.lower()
+            if norm in vistos:
+                continue
+            vistos.add(norm)
+            candidatos.append(urljoin(self.target_url + '/', endpoint.lstrip('/')))
+
+        for path in ('/api/token', '/api/auth/token', '/auth/token', '/token', '/api/session', '/jwt'):
+            url = urljoin(self.target_url + '/', path.lstrip('/'))
+            if url.lower() in vistos:
+                continue
+            vistos.add(url.lower())
+            candidatos.append(url)
+
+        return candidatos[:8]
+
+    def _descubrir_tokens_jwt(self):
+        """Recolecta JWT desde las cookies de sesion y desde endpoints de emision."""
+        tokens = []
+        vistos = set()
+
+        # 1. Cookies de la sesion (incluye las obtenidas tras el login)
+        try:
+            for cookie in self.session.cookies:
+                valor = cookie.value or ''
+                if es_jwt(valor) and valor not in vistos:
+                    vistos.add(valor)
+                    tokens.append({
+                        'token': valor,
+                        'origen': f"cookie '{cookie.name}'",
+                        'transporte': 'cookie',
+                        'nombre': cookie.name
+                    })
+        except Exception:
+            pass
+
+        # 2. Endpoints que emiten tokens
+        for url in self._candidatos_token():
+            try:
+                resp = self.session.get(url, timeout=DEFAULT_TIMEOUT)
+                texto = resp.text or ''
+            except Exception:
+                continue
+            for token in extraer_jwts(texto):
+                if token in vistos:
+                    continue
+                vistos.add(token)
+                tokens.append({
+                    'token': token,
+                    'origen': url,
+                    'transporte': 'header',
+                    'nombre': 'Authorization'
+                })
+
+        return tokens
+
+    def _probe_autenticado(self, cookie_name):
+        """Endpoint que responde 200 con el token valido y no deberia con uno invalidado."""
+        for url in (self.crawl_data.get('visited') or [])[:6]:
+            if self._es_asset_estatico(url):
+                continue
+            try:
+                resp = self.session.get(url, timeout=DEFAULT_TIMEOUT, allow_redirects=False)
+                if resp.status_code != 200 or not self._es_respuesta_real(resp):
+                    continue
+                # Control: con el token invalidado la pagina no debe seguir accesible
+                invalido = self.session.get(url, timeout=DEFAULT_TIMEOUT, allow_redirects=False, cookies={cookie_name: 'invalido'})
+                if invalido.status_code == 200 and self._es_respuesta_real(invalido):
+                    continue
+                return url
+            except Exception:
+                continue
+        return None
 
     def fase_descubrimiento(self):
         print(f"\n{ANSI_MAGENTA}=== DESCUBRIMIENTO (CRAWLER) ==={ANSI_RESET}")
@@ -274,6 +429,16 @@ class AuditoriaMejorada:
                 self.print_result("Login / Autenticacion", login_status, login_msg)
         else:
             self.print_result("Login / Autenticacion", "SKIP", "Requiere --username y --password")
+
+        # Inicialización de Sesión B (Usuario secundario para IDOR o sesión anónima/invitado)
+        if self.username2 and self.password2:
+            auth2 = AuthSession(self.session_b, self.target_url, self.username2, self.password2, self.login_path)
+            ok2, msg2 = auth2.attempt_login(self.crawl_data['forms'])
+            self.session_b_authenticated = ok2
+            self.session_b_info = f"Sesion B autenticada ({self.username2})" if ok2 else f"Sesion B fallo auth: {msg2}"
+        else:
+            self.session_b_authenticated = False
+            self.session_b_info = "Sesion B anonima (Guest)"
 
         self.result.crawl_data = self.crawl_data
         self.result.api_endpoints = self.api_endpoints
@@ -466,6 +631,85 @@ class AuditoriaMejorada:
         except Exception as e:
             return self.print_result("Inyeccion SQL (SQLi)", "FAIL", f"Error: {e}")
 
+    def test_ssti(self):
+        try:
+            candidatos = self._target_urls_para_inyeccion()
+            scanner = SSTIScanner(self.session, timeout=DEFAULT_TIMEOUT)
+            confirmados = []
+            confirmadas_urls = set()
+            probadas = 0
+
+            for base_url, params in candidatos:
+                if probadas >= 60:
+                    break
+                if base_url in confirmadas_urls:
+                    continue
+                params_a_probar = (params & SSTI_PARAM_HINTS) or params
+                for param in list(params_a_probar)[:6]:
+                    if probadas >= 60:
+                        break
+                    probadas += 1
+                    try:
+                        hallazgos = scanner.scan_endpoint(base_url, param)
+                    except Exception:
+                        continue
+                    if not hallazgos:
+                        continue
+                    # Un parametro vulnerable ya confirma la evaluacion de
+                    # plantillas en ese endpoint: no se repite por cada parametro
+                    confirmadas_urls.add(base_url)
+                    for h in hallazgos:
+                        confirmados.append(f"{param} ({h.get('technique', 'SSTI')}) @ {base_url}")
+                        self.add_finding("SSTI (Template Injection)", h['detalle'], base_url)
+                    break
+
+            if confirmados:
+                return self.print_result("SSTI (Template Injection)", "FAIL", f"{len(confirmados)} confirmados (ej: {confirmados[0]}) de {probadas} parametros probados")
+            if probadas == 0:
+                return self.print_result("SSTI (Template Injection)", "SKIP", "Sin endpoints/parametros descubiertos para probar")
+            return self.print_result("SSTI (Template Injection)", "PASS", f"No se detecto evaluacion de plantillas en {probadas} parametros probados")
+        except Exception as e:
+            return self.print_result("SSTI (Template Injection)", "FAIL", f"Error: {e}")
+
+    def test_command_injection(self):
+        try:
+            candidatos = self._target_urls_para_inyeccion()
+            scanner = CommandInjectionScanner(self.session, timeout=DEFAULT_TIMEOUT)
+            confirmados = []
+            confirmadas_urls = set()
+            probadas = 0
+
+            for base_url, params in candidatos:
+                if probadas >= 30:
+                    break
+                if base_url in confirmadas_urls:
+                    continue
+                params_a_probar = (params & CMDI_PARAM_HINTS) or params
+                for param in list(params_a_probar)[:5]:
+                    if probadas >= 30:
+                        break
+                    probadas += 1
+                    try:
+                        hallazgos = scanner.scan_endpoint(base_url, param)
+                    except Exception:
+                        continue
+                    if not hallazgos:
+                        continue
+                    # Un parametro confirmado ya valida la inyeccion en ese endpoint
+                    confirmadas_urls.add(base_url)
+                    for h in hallazgos:
+                        confirmados.append(f"{param} ({h.get('technique', 'CMDi')}) @ {base_url}")
+                        self.add_finding("OS Command Injection", h['detalle'], base_url)
+                    break
+
+            if confirmados:
+                return self.print_result("OS Command Injection", "FAIL", f"{len(confirmados)} confirmados (ej: {confirmados[0]}) de {probadas} parametros probados")
+            if probadas == 0:
+                return self.print_result("OS Command Injection", "SKIP", "Sin endpoints/parametros descubiertos para probar")
+            return self.print_result("OS Command Injection", "PASS", f"No se detecto inyeccion de comandos (Output y Time-based) en {probadas} parametros probados")
+        except Exception as e:
+            return self.print_result("OS Command Injection", "FAIL", f"Error: {e}")
+
     def test_path_traversal(self):
         try:
             candidatos = self._target_urls_para_inyeccion()
@@ -519,6 +763,39 @@ class AuditoriaMejorada:
         except Exception as e:
             return self.print_result("Open Redirect Inseguro", "FAIL", f"Error: {e}")
 
+    def test_ssrf(self):
+        try:
+            scanner = SSRFScanner(self.session, timeout=DEFAULT_TIMEOUT)
+            confirmados = []
+            sospechosos = []
+            probadas = 0
+
+            for base_url, param in self._candidatos_ssrf():
+                if probadas >= 40:
+                    break
+                probadas += 1
+                try:
+                    hallazgos = scanner.scan_endpoint(base_url, param)
+                except Exception:
+                    continue
+                for h in hallazgos:
+                    if h.get('severity') == 'critica':
+                        confirmados.append(f"{param} ({h.get('technique', 'SSRF')}) @ {base_url}")
+                        self.add_finding("SSRF / Cloud Metadata", h['detalle'], base_url)
+                    else:
+                        sospechosos.append(f"{param} ({h.get('technique', 'SSRF')}) @ {base_url}")
+                        self.add_finding("SSRF - Sospecha", h['detalle'], base_url)
+
+            if confirmados:
+                return self.print_result("SSRF / Cloud Metadata", "FAIL", f"{len(confirmados)} confirmados (ej: {confirmados[0]}) de {probadas} parametros probados")
+            if sospechosos:
+                return self.print_result("SSRF / Cloud Metadata", "WARN", f"{len(sospechosos)} sospechosos sin confirmar (ej: {sospechosos[0]}) - revisar")
+            if probadas == 0:
+                return self.print_result("SSRF / Cloud Metadata", "SKIP", "Sin parametros candidatos a SSRF descubiertos")
+            return self.print_result("SSRF / Cloud Metadata", "PASS", f"No se detecto SSRF ni acceso a metadatos en {probadas} parametros probados")
+        except Exception as e:
+            return self.print_result("SSRF / Cloud Metadata", "FAIL", f"Error: {e}")
+
     def test_api_discovery(self):
         try:
             endpoints = []
@@ -539,6 +816,31 @@ class AuditoriaMejorada:
             return self.print_result("API Discovery", "WARN", "No se detectaron APIs")
         except Exception as e:
             return self.print_result("API Discovery", "FAIL", f"Error: {e}")
+
+    def test_graphql_introspection(self):
+        try:
+            scanner = GraphQLIntrospectionScanner(self.session, timeout=DEFAULT_TIMEOUT)
+            confirmados = []
+            probadas = 0
+
+            for url in self._candidatos_graphql():
+                probadas += 1
+                try:
+                    hallazgos = scanner.scan_endpoint(url)
+                except Exception:
+                    continue
+                for h in hallazgos:
+                    confirmados.append(url)
+                    self.add_finding("GraphQL Introspection", h['detalle'], url)
+
+            graphql_vistos = len(scanner.endpoints_graphql)
+            if confirmados:
+                return self.print_result("GraphQL Introspection", "FAIL", f"{len(confirmados)} endpoints con introspeccion habilitada (ej: {confirmados[0]})")
+            if graphql_vistos:
+                return self.print_result("GraphQL Introspection", "PASS", f"{graphql_vistos} endpoints GraphQL detectados, ninguno permite introspeccion")
+            return self.print_result("GraphQL Introspection", "SKIP", f"No se detectaron endpoints GraphQL ({probadas} rutas probadas)")
+        except Exception as e:
+            return self.print_result("GraphQL Introspection", "FAIL", f"Error: {e}")
 
     def test_tech_detection(self):
         try:
@@ -658,6 +960,169 @@ class AuditoriaMejorada:
         except Exception as e:
             return self.print_result("Path Scan", "FAIL", f"Error: {e}")
 
+    def test_forbidden_bypass(self):
+        try:
+            scanner = AccessControl403Scanner(
+                self.session,
+                timeout=DEFAULT_TIMEOUT,
+                es_respuesta_real=self._es_respuesta_real
+            )
+
+            protegidas = []
+            for path in SENSITIVE_PROTECTED_PATHS:
+                try:
+                    url = urljoin(self.target_url + '/', path.lstrip('/'))
+                    resp = self.session.get(url, timeout=3, allow_redirects=False)
+                    if resp.status_code in (401, 403):
+                        protegidas.append(url)
+                except Exception:
+                    continue
+                if len(protegidas) >= 6:
+                    break
+
+            if not protegidas:
+                return self.print_result("Bypass de 403", "SKIP", f"Ninguna de las {len(SENSITIVE_PROTECTED_PATHS)} rutas sensibles probadas respondio 401/403")
+
+            confirmados = []
+            for url in protegidas:
+                try:
+                    hallazgos = scanner.scan_endpoint(url)
+                except Exception:
+                    continue
+                for h in hallazgos:
+                    confirmados.append(f"{url} -> {h.get('technique', 'bypass')}")
+                    self.add_finding("Bypass de 403", h['detalle'], h.get('url', url))
+
+            if confirmados:
+                return self.print_result("Bypass de 403", "FAIL", f"{len(confirmados)} bypass confirmados (ej: {confirmados[0]})")
+            return self.print_result("Bypass de 403", "PASS", f"{len(protegidas)} rutas protegidas (401/403) sin bypass con cabeceras, verbos ni manipulacion de ruta")
+        except Exception as e:
+            return self.print_result("Bypass de 403", "FAIL", f"Error: {e}")
+
+    def test_jwt_audit(self):
+        try:
+            scanner = JWTScanner(self.session, timeout=DEFAULT_TIMEOUT)
+            tokens = self._descubrir_tokens_jwt()
+
+            if not tokens:
+                return self.print_result("Auditoria JWT", "SKIP", "No se encontro ningun JWT en cookies ni en endpoints de emision")
+
+            confirmados = []
+            for item in tokens:
+                for h in scanner.analyze(item['token'], item['origen']):
+                    nombre = h.get('test', 'Auditoria JWT')
+                    confirmados.append(f"{nombre} @ {item['origen']}")
+                    self.add_finding(nombre, h['detalle'], item['origen'])
+
+            # Analisis activo: solo con tokens en cookie (transporte controlable)
+            en_cookie = next((i for i in tokens if i['transporte'] == 'cookie'), None)
+            if en_cookie:
+                probe = self._probe_autenticado(en_cookie['nombre'])
+                if probe:
+                    for h in scanner.test_alg_none_aceptado(probe, en_cookie['token'], 'cookie', en_cookie['nombre']):
+                        nombre = h.get('test', 'Auditoria JWT')
+                        confirmados.append(f"{nombre} @ {probe}")
+                        self.add_finding(nombre, h['detalle'], probe)
+
+            if confirmados:
+                return self.print_result("Auditoria JWT", "FAIL", f"{len(confirmados)} debilidades (ej: {confirmados[0]}) en {len(tokens)} tokens analizados")
+            return self.print_result("Auditoria JWT", "PASS", f"{len(tokens)} tokens analizados sin firma debil, claims sensibles ni expiracion ausente")
+        except Exception as e:
+            return self.print_result("Auditoria JWT", "FAIL", f"Error: {e}")
+
+    def _candidatos_idor(self):
+        """Identifica endpoints con identificadores de objeto (en query o REST) y rutas sensibles comunes."""
+        candidatos = []
+        vistos = set()
+
+        def _agregar(url, param=None):
+            clave = (url, param)
+            if clave not in vistos and not self._es_asset_estatico(url):
+                vistos.add(clave)
+                candidatos.append((url, param))
+
+        # 1. URLs visitadas con query params o rutas REST
+        for u in self.crawl_data.get('visited', []):
+            parsed = urlparse(u)
+            if parsed.query:
+                qs = parse_qs(parsed.query, keep_blank_values=True)
+                for p, vals in qs.items():
+                    p_lower = p.lower()
+                    if p_lower in IDOR_PARAM_HINTS or (vals and any(v.isdigit() for v in vals)):
+                        _agregar(u, p)
+            for pat in REST_ID_PATTERNS:
+                if pat.search(parsed.path):
+                    _agregar(u, None)
+
+        # 2. Query params descubiertos por el crawler
+        for u, params in self.crawl_data.get('query_params', {}).items():
+            for p in params:
+                if p.lower() in IDOR_PARAM_HINTS:
+                    full_u = f"{u}?{p}=1"
+                    _agregar(full_u, p)
+
+        # 3. Endpoints descubiertos en bundles JS
+        for endpoint in self.crawl_data.get('js_endpoints', []):
+            for pat in REST_ID_PATTERNS:
+                if pat.search(endpoint):
+                    full_u = urljoin(self.target_url, endpoint)
+                    _agregar(full_u, None)
+
+        # 4. Fallback: Probar rutas de objetos comunes si se encontraron pocos candidatos
+        if len(candidatos) < 5:
+            for ruta in COMMON_OBJECT_PATHS:
+                full_u = urljoin(self.target_url + '/', ruta.lstrip('/'))
+                parsed = urlparse(full_u)
+                param = None
+                if parsed.query:
+                    qs = parse_qs(parsed.query)
+                    for k in qs:
+                        if k.lower() in IDOR_PARAM_HINTS:
+                            param = k
+                            break
+                _agregar(full_u, param)
+
+        return candidatos[:30]
+
+    def test_idor(self):
+        try:
+            scanner = IDORScanner(
+                session_a=self.session,
+                session_b=self.session_b,
+                timeout=DEFAULT_TIMEOUT,
+                es_respuesta_real=self._es_respuesta_real,
+                session_b_authenticated=self.session_b_authenticated
+            )
+            candidatos = self._candidatos_idor()
+            if not candidatos:
+                return self.print_result("Auditoria IDOR (Doble Sesion)", "SKIP", "Sin endpoints ni identificadores de objeto para probar")
+
+            confirmados = []
+            probadas = 0
+
+            for url, param in candidatos:
+                probadas += 1
+                try:
+                    hallazgos = scanner.scan_endpoint(url, param=param)
+                except Exception:
+                    continue
+                for h in hallazgos:
+                    nombre = h.get('test', 'Auditoria IDOR (Doble Sesion)')
+                    confirmados.append(f"{h.get('technique', 'IDOR')} @ {h.get('url', url)}")
+                    self.add_finding(nombre, h['detalle'], h.get('url', url), cwe=h.get('cwe', 'CWE-639'))
+
+            if confirmados:
+                return self.print_result(
+                    "Auditoria IDOR (Doble Sesion)", "FAIL",
+                    f"{len(confirmados)} vulnerabilidades IDOR confirmadas (ej: {confirmados[0]}) [{self.session_b_info}]"
+                )
+            return self.print_result(
+                "Auditoria IDOR (Doble Sesion)", "PASS",
+                f"Control de acceso a nivel de objeto verificado en {probadas} endpoints probados [{self.session_b_info}]"
+            )
+        except Exception as e:
+            return self.print_result("Auditoria IDOR (Doble Sesion)", "FAIL", f"Error: {e}")
+
     def _reporte_txt(self, output_path=None):
         ahora = dt.datetime.now()
         report_dir = _get_report_dir()
@@ -693,15 +1158,15 @@ class AuditoriaMejorada:
         ejecutadas = total - skipped
         score = ((passed + warns) / ejecutadas * 100) if ejecutadas > 0 else 0.0
 
-        criticos_fail = [n for n in ('Inyeccion SQL (SQLi)', 'Directory / Path Traversal', 'Inyeccion XSS Reflejado') if self.test_statuses.get(n) == 'FAIL']
+        criticos_fail = [n for n in ('Inyeccion SQL (SQLi)', 'Directory / Path Traversal', 'Inyeccion XSS Reflejado', 'Auditoria IDOR (Doble Sesion)') if self.test_statuses.get(n) == 'FAIL']
         if criticos_fail:
-            nivel_riesgo, riesgo_css = ('CRITICO - Vulnerabilidad activa explotable', 'risk-critical')
+            nivel_riesgo, riesgo_css = ('CRITICAL - Active Exploitable Vulnerabilities', 'risk-critical')
         elif failed > 0:
-            nivel_riesgo, riesgo_css = ('ALTO - Vulnerabilidades activas', 'risk-moderate')
+            nivel_riesgo, riesgo_css = ('HIGH - Active Vulnerabilities Detected', 'risk-critical')
         elif warns > 0:
-            nivel_riesgo, riesgo_css = ('MODERADO - Requiere endurecimiento', 'risk-moderate')
+            nivel_riesgo, riesgo_css = ('MODERATE - Hardening Required', 'risk-moderate')
         else:
-            nivel_riesgo, riesgo_css = ('EXCELENTE - Postura segura', 'risk-excellent')
+            nivel_riesgo, riesgo_css = ('EXCELLENT - Secure Posture', 'risk-excellent')
 
         ahora = dt.datetime.now()
         report_dir = _get_report_dir()
@@ -727,10 +1192,57 @@ class AuditoriaMejorada:
                 <div class="stat-label">{html.escape(status)}</div>
             </div>""")
 
+        group_names = {
+            'Auditoria Avanzada': 'Advanced Security Scans',
+            'Seguridad OWASP Top 10': 'OWASP Top 10 Vulnerabilities',
+            'Arquitectura y Configuracion': 'Architecture & Configuration',
+            'Experiencia de Usuario': 'User Experience (UX)',
+            'Otras Pruebas': 'General Security Checks'
+        }
+
+        test_names = {
+            'API Discovery': 'API Endpoint Discovery',
+            'Archivos Estaticos Optimizados': 'Static Assets Optimization',
+            'Auditoria JWT': 'JWT Security Audit',
+            'Auditoria IDOR (Doble Sesion)': 'IDOR / BOLA Dual-Session Audit',
+            'Bypass de 403': '403 / 401 Access Control Bypass',
+            'Calibracion Soft-404': 'Soft-404 Dynamic Calibration',
+            'Certificado SSL/TLS': 'SSL/TLS Certificate Verification',
+            'Dependency Scan': 'Dependency & Package Scan',
+            'Descubrimiento (Crawler)': 'Web Crawler Discovery',
+            'Directory / Path Traversal': 'Directory / Path Traversal (LFI)',
+            'Diseno Responsive': 'Responsive Layout Check',
+            'Exposicion de Secretos en JS': 'JS Secrets & Credential Exposure',
+            'GraphQL Introspection': 'GraphQL Introspection',
+            'HTTPS Obligatorio': 'Mandatory HTTPS Enforcement',
+            'Headers Seguridad': 'HTTP Security Headers',
+            'Inyeccion SQL (SQLi)': 'SQL Injection (SQLi)',
+            'Inyeccion SQL (SQLi) - Sospecha': 'SQL Injection (SQLi) - Suspicion',
+            'Inyeccion XSS Reflejado': 'Reflected XSS Injection',
+            'JS Static Analysis': 'JavaScript Static Analysis',
+            'JWT Claims Sensibles': 'JWT Sensitive Claims Exposure',
+            'JWT Firma No Validada': 'JWT Signature Verification Failure',
+            'JWT Secreto HMAC Debil': 'Weak HMAC Secret (JWT)',
+            'JWT Sin Expiracion': 'JWT Missing Expiration (exp)',
+            'JWT Sin Firma (alg none)': 'Unsigned JWT Token (alg: none)',
+            'Login / Autenticacion': 'Authentication & Login Form Check',
+            'OS Command Injection': 'OS Command Injection',
+            'Open Redirect Inseguro': 'Insecure Open Redirect',
+            'Path Scan': 'Sensitive Path & Directory Scan',
+            'Performance': 'Performance Metrics',
+            'SPA Discovery': 'SPA Dynamic Discovery',
+            'SSRF / Cloud Metadata': 'SSRF & Cloud Metadata',
+            'SSRF - Sospecha': 'SSRF - Suspicion',
+            'SSTI (Template Injection)': 'Server-Side Template Injection (SSTI)',
+            'Tech Detection': 'Technology Stack Fingerprinting'
+        }
+
         grupos = {}
         for nombre, status in self.test_statuses.items():
             meta = TEST_METADATA.get(nombre, DEFAULT_METADATA)
-            grupos.setdefault(meta['grupo'], []).append((nombre, status))
+            raw_group = meta.get('grupo', 'Otras Pruebas')
+            eng_group = group_names.get(raw_group, raw_group)
+            grupos.setdefault(eng_group, []).append((nombre, status))
 
         secciones_html = []
         for grupo, pruebas in grupos.items():
@@ -738,10 +1250,11 @@ class AuditoriaMejorada:
             for nombre, status in pruebas:
                 meta_status = STATUS_META.get(status, STATUS_META_DEFAULT)
                 meta_test = TEST_METADATA.get(nombre, DEFAULT_METADATA)
+                display_name = test_names.get(nombre, nombre)
                 mensaje = html.escape(self.test_messages.get(nombre, ''))
                 filas.append(f"""
                 <tr>
-                    <td class="col-test">{html.escape(nombre)}</td>
+                    <td class="col-test">{html.escape(display_name)}</td>
                     <td><span class="badge badge-{meta_status['css']}">{html.escape(status)}</span></td>
                     <td class="col-owasp">{html.escape(meta_test.get('owasp', 'General'))}</td>
                     <td class="col-msg">{mensaje}</td>
@@ -750,118 +1263,273 @@ class AuditoriaMejorada:
             <div class="group-section">
                 <h3>{html.escape(grupo)}</h3>
                 <table>
-                    <thead><tr><th>Prueba</th><th>Estado</th><th>Categoria OWASP</th><th>Detalle</th></tr></thead>
+                    <thead><tr><th>Test Name</th><th>Status</th><th>OWASP Category</th><th>Diagnostic Detail</th></tr></thead>
                     <tbody>{''.join(filas)}</tbody>
                 </table>
             </div>""")
 
-        orden_severidad = {'critica': 0, 'alta': 1, 'media': 2, 'baja': 3, 'info': 4}
-        findings_ordenados = sorted(self.findings, key=lambda f: orden_severidad.get(f.get('severidad', 'info'), 5))
+        orden_severidad = {'critica': 0, 'critical': 0, 'alta': 1, 'high': 1, 'media': 2, 'medium': 2, 'baja': 3, 'low': 3, 'info': 4}
+        findings_ordenados = sorted(self.findings, key=lambda f: orden_severidad.get(f.get('severidad', f.get('severity', 'info')), 5))
+        
+        sev_labels = {
+            'critica': 'CRITICAL',
+            'critical': 'CRITICAL',
+            'alta': 'HIGH',
+            'high': 'HIGH',
+            'media': 'MEDIUM',
+            'medium': 'MEDIUM',
+            'baja': 'LOW',
+            'low': 'LOW',
+            'info': 'INFO'
+        }
+
         if findings_ordenados:
             filas_f = []
             for f in findings_ordenados:
+                raw_sev = f.get('severidad', f.get('severity', 'info'))
+                disp_sev = sev_labels.get(raw_sev.lower(), raw_sev.upper())
+                raw_test = f.get('test', '')
+                disp_test = test_names.get(raw_test, raw_test)
+                detalle = f.get('detalle', f.get('description', ''))
+                url_val = f.get('url', f.get('endpoint', ''))
                 filas_f.append(f"""
                 <tr>
-                    <td><span class="sev sev-{html.escape(f.get('severidad', 'info'))}">{html.escape(f.get('severidad', 'info').upper())}</span></td>
-                    <td>{html.escape(f.get('test', ''))}</td>
-                    <td>{html.escape(f.get('detalle', ''))}</td>
-                    <td class="col-url">{html.escape(f.get('url', ''))}</td>
+                    <td><span class="sev sev-{html.escape(raw_sev.lower())}">{html.escape(disp_sev)}</span></td>
+                    <td>{html.escape(disp_test)}</td>
+                    <td>{html.escape(detalle)}</td>
+                    <td class="col-url">{html.escape(url_val)}</td>
                 </tr>""")
             findings_html = f"""
             <div class="group-section">
-                <h3>Hallazgos Detallados ({failed})</h3>
+                <h3>Detailed Findings ({len(findings_ordenados)})</h3>
                 <table>
-                    <thead><tr><th>Severidad</th><th>Prueba</th><th>Detalle</th><th>URL / Endpoint</th></tr></thead>
+                    <thead><tr><th>Severity</th><th>Vulnerability / Test</th><th>Evidence & Detail</th><th>Affected URL / Endpoint</th></tr></thead>
                     <tbody>{''.join(filas_f)}</tbody>
                 </table>
             </div>"""
         else:
-            findings_html = '<div class="group-section"><p class="no-findings">No se registraron hallazgos con detalle adicional en esta ejecucion.</p></div>'
+            findings_html = '<div class="group-section"><p class="no-findings">No detailed vulnerability findings were identified in this audit run.</p></div>'
 
+        # Directory and attack surface extraction
         n_urls = len(self.crawl_data.get('visited', []))
         n_forms = len(self.crawl_data.get('forms', []))
-        urls_lista = ''.join(f"<li>{html.escape(u)}</li>" for u in self.crawl_data.get('visited', [])[:25])
+        n_paths = len(getattr(self, 'path_results', []))
+        n_apis = len(self.crawl_data.get('js_endpoints', []))
+
+        urls_lista = ''.join(f"<li>{html.escape(u)}</li>" for u in self.crawl_data.get('visited', [])[:30])
+        paths_lista = ''.join(f"<li><span class='path-badge'>PATH</span> {html.escape(p)}</li>" for p in getattr(self, 'path_results', [])[:30])
+        apis_lista = ''.join(f"<li><span class='api-badge'>API</span> {html.escape(a)}</li>" for a in self.crawl_data.get('js_endpoints', [])[:30])
+
         auth_ok, auth_msg = self.auth_status
+
+        paths_subblock = f"""
+        <div class="sub-block">
+            <h4>Discovered Paths & Directories ({n_paths})</h4>
+            {f'<ul class="url-list">{paths_lista}</ul>' if paths_lista else '<p class="no-findings">No exposed sensitive paths or directories detected during path scan.</p>'}
+        </div>"""
+
+        apis_subblock = f"""
+        <div class="sub-block">
+            <h4>Discovered API Endpoints & Routes ({n_apis})</h4>
+            {f'<ul class="url-list">{apis_lista}</ul>' if apis_lista else '<p class="no-findings">No external API endpoints identified in JavaScript analysis.</p>'}
+        </div>""" if n_apis > 0 else ""
+
+        crawled_subblock = f"""
+        <div class="sub-block">
+            <h4>Crawled Site URLs ({n_urls})</h4>
+            {f'<ul class="url-list">{urls_lista}</ul>' if urls_lista else '<p class="no-findings">No additional URLs crawled.</p>'}
+        </div>"""
+
         descubrimiento_html = f"""
         <div class="group-section">
-            <h3>Superficie Descubierta</h3>
-            <p><b>URLs visitadas:</b> {n_urls} &nbsp;|&nbsp; <b>Formularios:</b> {n_forms} &nbsp;|&nbsp;
-               <b>Autenticacion:</b> {'Exitosa' if auth_ok else 'No aplicada'} ({html.escape(auth_msg)})</p>
-            {f'<ul class="url-list">{urls_lista}</ul>' if urls_lista else '<p class="no-findings">Sin URLs adicionales descubiertas.</p>'}
+            <h3>Discovered Attack Surface & Directories</h3>
+            <p><b>Visited URLs:</b> {n_urls} &nbsp;|&nbsp; <b>Forms:</b> {n_forms} &nbsp;|&nbsp;
+               <b>Discovered Paths / Dirs:</b> {n_paths} &nbsp;|&nbsp;
+               <b>Authentication:</b> {'Authenticated' if auth_ok else 'Unauthenticated / Guest'} ({html.escape(auth_msg)})</p>
+            {paths_subblock}
+            {apis_subblock}
+            {crawled_subblock}
         </div>"""
 
         html_doc = f"""<!DOCTYPE html>
-<html lang="es">
+<html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>GHOSTS LIGHTER - Auditoria de {html.escape(self.hostname)}</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GHOSTS LIGHTER - Security Audit for {html.escape(self.hostname)}</title>
 <style>
   :root {{
-    --bg: #0f1117; --panel: #171a23; --border: #262b3a; --text: #e6e8ef; --muted: #8b90a3;
-    --pass: #2ecc71; --warn: #f1c40f; --fail: #e74c3c; --skip: #7f8c9a; --info: #3498db;
-    --accent: #6c5ce7;
+    --bg: #0a0405;
+    --panel: #140709;
+    --panel-hover: #1c0b0e;
+    --border: #3a1015;
+    --border-glow: #6e1a23;
+    --text: #f5e8ea;
+    --muted: #a68489;
+    --accent: #ff2a44;
+    --accent-glow: rgba(255, 42, 68, 0.25);
+    --pass: #2ecc71;
+    --warn: #f39c12;
+    --fail: #ff2a44;
+    --skip: #7a828e;
+    --info: #ff5266;
   }}
   * {{ box-sizing: border-box; }}
-  body {{ margin:0; font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; background: var(--bg); color: var(--text); }}
-  .container {{ max-width: 1100px; margin: 0 auto; padding: 32px 24px 64px; }}
-  header {{ text-align:center; margin-bottom: 24px; }}
-  header h1 {{ font-size: 28px; margin: 0; letter-spacing: 2px; color: var(--accent); }}
-  header p {{ color: var(--muted); margin: 6px 0 0; }}
-  .meta-box {{ background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px 20px; margin-bottom: 24px; }}
-  .meta-box div {{ margin: 4px 0; }}
-  .risk-banner {{ text-align:center; padding: 16px; border-radius: 10px; font-weight:600; font-size: 16px; margin-bottom: 24px; }}
-  .risk-critical {{ background: rgba(231,76,60,.15); border: 1px solid var(--fail); color: var(--fail); }}
-  .risk-moderate {{ background: rgba(241,196,15,.15); border: 1px solid var(--warn); color: var(--warn); }}
-  .risk-good {{ background: rgba(52,152,219,.15); border: 1px solid var(--info); color: var(--info); }}
-  .risk-excellent {{ background: rgba(46,204,113,.15); border: 1px solid var(--pass); color: var(--pass); }}
-  .stats-grid {{ display:flex; flex-wrap: wrap; gap: 12px; margin-bottom: 28px; }}
-  .stat-card {{ flex: 1; min-width: 110px; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; text-align:center; }}
-  .stat-number {{ font-size: 28px; font-weight: 700; }}
-  .stat-label {{ color: var(--muted); font-size: 12px; letter-spacing: 1px; margin-top:4px; }}
+  body {{
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.5;
+  }}
+  .container {{ max-width: 1120px; margin: 0 auto; padding: 36px 24px 64px; }}
+  header {{ text-align: center; margin-bottom: 28px; }}
+  header h1 {{
+    font-size: 32px;
+    margin: 0;
+    letter-spacing: 3px;
+    color: var(--accent);
+    text-shadow: 0 0 25px var(--accent-glow);
+    font-weight: 800;
+  }}
+  header p {{ color: var(--muted); margin: 6px 0 0; font-size: 14px; }}
+  .meta-box {{
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px 24px;
+    margin-bottom: 24px;
+    box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+  }}
+  .meta-box div {{ margin: 5px 0; font-size: 13.5px; }}
+  .meta-box b {{ color: #ff6b7e; }}
+  .risk-banner {{
+    text-align: center;
+    padding: 16px;
+    border-radius: 10px;
+    font-weight: 700;
+    font-size: 15px;
+    margin-bottom: 24px;
+    letter-spacing: 0.5px;
+  }}
+  .risk-critical {{
+    background: rgba(255, 42, 68, 0.16);
+    border: 1px solid var(--fail);
+    color: #ff5266;
+    box-shadow: 0 0 20px rgba(255, 42, 68, 0.25);
+  }}
+  .risk-moderate {{
+    background: rgba(243, 156, 18, 0.15);
+    border: 1px solid var(--warn);
+    color: var(--warn);
+  }}
+  .risk-excellent {{
+    background: rgba(46, 204, 113, 0.15);
+    border: 1px solid var(--pass);
+    color: var(--pass);
+  }}
+  .stats-grid {{ display: flex; flex-wrap: wrap; gap: 14px; margin-bottom: 28px; }}
+  .stat-card {{
+    flex: 1;
+    min-width: 120px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px;
+    text-align: center;
+    transition: transform 0.15s ease, border-color 0.15s ease;
+  }}
+  .stat-card:hover {{ transform: translateY(-2px); border-color: var(--border-glow); }}
+  .stat-number {{ font-size: 30px; font-weight: 800; }}
+  .stat-label {{ color: var(--muted); font-size: 11px; letter-spacing: 1.5px; margin-top: 4px; font-weight: 600; }}
   .stat-pass .stat-number {{ color: var(--pass); }}
   .stat-warn .stat-number {{ color: var(--warn); }}
-  .stat-fail .stat-number {{ color: var(--fail); }}
+  .stat-fail .stat-number {{ color: var(--fail); text-shadow: 0 0 15px rgba(255, 42, 68, 0.4); }}
   .stat-skip .stat-number {{ color: var(--skip); }}
-  .stat-info .stat-number {{ color: var(--info); }}
-  .score-box {{ text-align:center; margin-bottom: 32px; }}
-  .score-value {{ font-size: 48px; font-weight: 800; color: var(--accent); }}
-  .score-label {{ color: var(--muted); }}
-  .group-section {{ background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 20px; margin-bottom: 20px; }}
-  .group-section h3 {{ margin-top:0; color: var(--accent); border-bottom: 1px solid var(--border); padding-bottom: 8px; }}
-  table {{ width:100%; border-collapse: collapse; font-size: 13px; }}
-  th, td {{ text-align:left; padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }}
-  th {{ color: var(--muted); font-weight: 600; text-transform: uppercase; font-size: 11px; letter-spacing: .5px; }}
-  .col-test {{ font-weight: 600; white-space: nowrap; }}
-  .col-owasp {{ color: var(--muted); white-space: nowrap; }}
-  .col-url {{ color: var(--muted); word-break: break-all; }}
-  .badge {{ display:inline-block; padding: 3px 10px; border-radius: 20px; font-size: 11px; font-weight:700; letter-spacing: .5px; }}
-  .badge-pass {{ background: rgba(46,204,113,.15); color: var(--pass); }}
-  .badge-warn {{ background: rgba(241,196,15,.15); color: var(--warn); }}
-  .badge-fail {{ background: rgba(231,76,60,.15); color: var(--fail); }}
-  .badge-skip {{ background: rgba(127,140,154,.15); color: var(--skip); }}
-  .badge-info {{ background: rgba(52,152,219,.15); color: var(--info); }}
-  .sev {{ display:inline-block; padding: 3px 10px; border-radius: 6px; font-size: 11px; font-weight:700; }}
-  .sev-critica {{ background: var(--fail); color: #fff; }}
-  .sev-alta {{ background: rgba(231,76,60,.5); color: #fff; }}
-  .sev-media {{ background: rgba(241,196,15,.4); color: #111; }}
-  .sev-baja {{ background: rgba(127,140,154,.4); color: #fff; }}
-  .sev-info {{ background: rgba(52,152,219,.35); color: #fff; }}
-  .no-findings {{ color: var(--muted); }}
-  .url-list {{ column-count: 2; font-size: 12px; color: var(--muted); max-height: 220px; overflow-y:auto; }}
-  footer {{ text-align:center; color: var(--muted); font-size: 12px; margin-top: 40px; }}
+  .stat-info .stat-number {{ color: #ff7686; }}
+  .score-box {{ text-align: center; margin-bottom: 32px; }}
+  .score-value {{
+    font-size: 52px;
+    font-weight: 900;
+    color: var(--accent);
+    text-shadow: 0 0 30px rgba(255, 42, 68, 0.35);
+  }}
+  .score-label {{ color: var(--muted); font-size: 13px; max-width: 600px; margin: 0 auto; }}
+  .group-section {{
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 22px;
+    margin-bottom: 24px;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+  }}
+  .group-section h3 {{
+    margin-top: 0;
+    color: var(--accent);
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 10px;
+    font-size: 18px;
+    letter-spacing: 0.5px;
+  }}
+  .sub-block {{ margin-top: 18px; }}
+  .sub-block h4 {{
+    margin: 0 0 8px;
+    color: #ff6b7e;
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+  }}
+  table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
+  th, td {{ text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }}
+  th {{ color: var(--muted); font-weight: 700; text-transform: uppercase; font-size: 11px; letter-spacing: .8px; }}
+  tr:hover td {{ background: rgba(255, 42, 68, 0.03); }}
+  .col-test {{ font-weight: 600; white-space: nowrap; color: #fce8eb; }}
+  .col-owasp {{ color: var(--muted); white-space: nowrap; font-size: 12px; }}
+  .col-msg {{ color: #d6b8bd; }}
+  .col-url {{ color: var(--muted); word-break: break-all; font-family: monospace; font-size: 12px; }}
+  .badge {{ display: inline-block; padding: 3px 10px; border-radius: 20px; font-size: 11px; font-weight: 700; letter-spacing: .5px; }}
+  .badge-pass {{ background: rgba(46, 204, 113, 0.15); color: var(--pass); border: 1px solid rgba(46, 204, 113, 0.3); }}
+  .badge-warn {{ background: rgba(243, 156, 18, 0.15); color: var(--warn); border: 1px solid rgba(243, 156, 18, 0.3); }}
+  .badge-fail {{ background: rgba(255, 42, 68, 0.18); color: #ff5266; border: 1px solid rgba(255, 42, 68, 0.4); }}
+  .badge-skip {{ background: rgba(122, 130, 142, 0.15); color: var(--skip); border: 1px solid rgba(122, 130, 142, 0.3); }}
+  .badge-info {{ background: rgba(255, 82, 102, 0.15); color: #ff7686; border: 1px solid rgba(255, 82, 102, 0.3); }}
+  .sev {{ display: inline-block; padding: 3px 10px; border-radius: 6px; font-size: 11px; font-weight: 800; letter-spacing: 0.5px; }}
+  .sev-critica, .sev-critical {{ background: #ff2a44; color: #fff; box-shadow: 0 0 10px rgba(255, 42, 68, 0.4); }}
+  .sev-alta, .sev-high {{ background: rgba(255, 42, 68, 0.65); color: #fff; }}
+  .sev-media, .sev-medium {{ background: rgba(243, 156, 18, 0.65); color: #fff; }}
+  .sev-baja, .sev-low {{ background: rgba(122, 130, 142, 0.5); color: #fff; }}
+  .sev-info {{ background: rgba(255, 82, 102, 0.4); color: #fff; }}
+  .path-badge {{ display: inline-block; font-size: 10px; font-weight: 700; padding: 1px 6px; border-radius: 4px; background: rgba(255, 42, 68, 0.2); color: #ff6b7e; margin-right: 6px; }}
+  .api-badge {{ display: inline-block; font-size: 10px; font-weight: 700; padding: 1px 6px; border-radius: 4px; background: rgba(52, 152, 219, 0.2); color: #5dade2; margin-right: 6px; }}
+  .no-findings {{ color: var(--muted); font-size: 13px; font-style: italic; margin: 6px 0; }}
+  .url-list {{
+    column-count: 2;
+    font-family: monospace;
+    font-size: 12px;
+    color: #e3cad0;
+    max-height: 240px;
+    overflow-y: auto;
+    background: #0f0506;
+    padding: 12px 18px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    margin: 8px 0;
+  }}
+  .url-list li {{ margin-bottom: 4px; word-break: break-all; }}
+  footer {{ text-align: center; color: var(--muted); font-size: 12px; margin-top: 40px; letter-spacing: 0.5px; }}
 </style>
 </head>
 <body>
 <div class="container">
   <header>
     <h1>GHOSTS LIGHTER</h1>
-    <p>Reporte de Auditoria de Seguridad Web</p>
+    <p>Web Application Security Assessment Report</p>
   </header>
 
   <div class="meta-box">
-    <div><b>Objetivo:</b> {html.escape(self.target_url)}</div>
-    <div><b>Fecha:</b> {ahora.strftime('%d/%m/%Y %H:%M:%S')}</div>
-    <div><b>Version:</b> GHOSTS LIGHTER v{PRODUCT_VERSION}</div>
+    <div><b>Target:</b> {html.escape(self.target_url)}</div>
+    <div><b>Audit Date:</b> {ahora.strftime('%Y-%m-%d %H:%M:%S')}</div>
+    <div><b>Engine Version:</b> GHOSTS LIGHTER v{PRODUCT_VERSION}</div>
   </div>
 
   <div class="risk-banner {riesgo_css}">{html.escape(nivel_riesgo)}</div>
@@ -870,14 +1538,14 @@ class AuditoriaMejorada:
 
   <div class="score-box">
     <div class="score-value">{score:.1f}%</div>
-    <div class="score-label">Volumen bruto de pruebas superadas sin ponderar criticidad (sobre {ejecutadas} ejecutadas, {skipped} omitidas)</div>
+    <div class="score-label">Overall test pass rate ({ejecutadas} executed, {skipped} skipped)</div>
   </div>
 
   {descubrimiento_html}
   {findings_html}
   {''.join(secciones_html)}
 
-  <footer>Reporte generado por GHOSTS LIGHTER v{PRODUCT_VERSION} &middot; OWASP Top 10:2025</footer>
+  <footer>Report generated by GHOSTS LIGHTER v{PRODUCT_VERSION} &middot; OWASP Top 10 (2025)</footer>
 </div>
 </body>
 </html>"""
@@ -887,64 +1555,85 @@ class AuditoriaMejorada:
         return os.path.abspath(output_path)
 
     def run_audit(self, generar_html=True, output_path=None):
-        print(f"{ICON_INFO} Iniciando Auditoria de Seguridad GHOSTS LIGHTER v{PRODUCT_VERSION}")
-        print(f"   Objetivo: {self.target_url}")
+        print(f"{ICON_INFO} Starting GHOSTS LIGHTER Security Audit v{PRODUCT_VERSION}")
+        print(f"   Target: {self.target_url}")
         print("===========================================================================")
 
-        total_fases = 15
+        total_fases = 22
         fase_actual = 0
 
         def avanzar_fase(nombre_etapa=""):
             nonlocal fase_actual
             fase_actual += 1
-            barra_progreso(fase_actual, total_fases, longitud=30, prefijo="Progreso Auditoría:")
+            barra_progreso(fase_actual, total_fases, longitud=30, prefijo="Audit Progress:")
             if nombre_etapa:
                 print(f"\n{ANSI_CYAN}--- [{fase_actual}/{total_fases}] {nombre_etapa} ---{ANSI_RESET}")
 
-        avanzar_fase("Descubrimiento y Crawler")
+        avanzar_fase("Discovery & Web Crawling")
         self.fase_descubrimiento()
 
-        avanzar_fase("Validación de HTTPS Obligatorio")
+        avanzar_fase("Mandatory HTTPS Validation")
         self.test_https_obligatorio()
 
-        avanzar_fase("Verificación de Certificado SSL/TLS")
+        avanzar_fase("SSL/TLS Certificate Verification")
         self.test_ssl_certificate()
 
-        avanzar_fase("Análisis de Headers de Seguridad")
+        avanzar_fase("Security Headers Analysis")
         self.test_security_headers()
 
-        avanzar_fase("Optimización de Archivos Estáticos")
+        avanzar_fase("Static Files Optimization")
         self.test_static_files()
 
-        avanzar_fase("Pruebas de Inyección XSS Reflejado")
+        avanzar_fase("Reflected XSS Injection Tests")
         self.test_xss_reflejado()
 
-        avanzar_fase("Pruebas de Inyección SQL (SQLi)")
+        avanzar_fase("SQL Injection (SQLi) Tests")
         self.test_sql_injection()
 
-        avanzar_fase("Escaneo de Directory / Path Traversal")
+        avanzar_fase("Server-Side Template Injection (SSTI) Tests")
+        self.test_ssti()
+
+        avanzar_fase("OS Command Injection Tests")
+        self.test_command_injection()
+
+        avanzar_fase("Directory / Path Traversal Scan")
         self.test_path_traversal()
 
-        avanzar_fase("Verificación de Open Redirect")
+        avanzar_fase("Insecure Open Redirect Verification")
         self.test_open_redirect()
 
-        avanzar_fase("Evaluación de Diseño Responsive")
+        avanzar_fase("SSRF & Cloud Metadata Tests")
+        self.test_ssrf()
+
+        avanzar_fase("Responsive Design Assessment")
         self.test_diseno_responsive()
 
-        avanzar_fase("Métricas de Performance")
+        avanzar_fase("Performance Metrics")
         self.test_performance()
 
-        avanzar_fase("Descubrimiento de APIs")
+        avanzar_fase("API Discovery")
         self.test_api_discovery()
 
-        avanzar_fase("Detección de Stack Tecnológico")
+        avanzar_fase("GraphQL Introspection")
+        self.test_graphql_introspection()
+
+        avanzar_fase("Technology Stack Detection")
         self.test_tech_detection()
 
-        avanzar_fase("Escaneo de Dependencias Expuestas")
+        avanzar_fase("Exposed Dependencies Scan")
         self.test_dependency_scan()
 
-        avanzar_fase("Escaneo de Rutas Sensibles (Path Scan)")
+        avanzar_fase("Sensitive Path Scan")
         self.test_path_scan()
+
+        avanzar_fase("Access Control Bypass (403/401)")
+        self.test_forbidden_bypass()
+
+        avanzar_fase("JWT Security Audit")
+        self.test_jwt_audit()
+
+        avanzar_fase("IDOR / Access Control Audit (Dual-Session)")
+        self.test_idor()
 
         total = len(self.test_results)
         passed = sum(1 for v in self.test_statuses.values() if v == 'PASS')
@@ -954,17 +1643,17 @@ class AuditoriaMejorada:
         score = ((passed + warns) / (total - skipped) * 100) if (total - skipped) > 0 else 0
 
         if failed > 0:
-            nivel_riesgo = 'CRITICO - Requiere atencion inmediata' if failed > 2 else 'ALTO - Vulnerabilidades activas'
+            nivel_riesgo = 'CRITICAL - Immediate attention required' if failed > 2 else 'HIGH - Active vulnerabilities detected'
         elif warns > 0:
-            nivel_riesgo = 'MODERADO - Requiere endurecimiento'
+            nivel_riesgo = 'MODERATE - Hardening recommended'
         else:
-            nivel_riesgo = 'BAJO - Postura aceptable'
+            nivel_riesgo = 'LOW - Acceptable security posture'
 
-        print(f"\n{ANSI_CYAN}=== RESUMEN DE AUDITORIA ==={ANSI_RESET}")
+        print(f"\n{ANSI_CYAN}=== AUDIT SUMMARY ==={ANSI_RESET}")
         print(f"   {ANSI_VERDE}PASS{ANSI_RESET}: {passed} | {ANSI_AMARILLO}WARN{ANSI_RESET}: {warns}")
         print(f"   {ANSI_ROJO}FAIL{ANSI_RESET}: {failed} | {ANSI_GRIS}SKIP{ANSI_RESET}: {skipped}")
-        print(f"   Total pruebas: {total} | Ejecutadas: {total - skipped}")
-        print(f"   Hallazgos detallados: {len(self.findings)} | Riesgo: {nivel_riesgo}")
+        print(f"   Total tests: {total} | Executed: {total - skipped}")
+        print(f"   Detailed findings: {len(self.findings)} | Risk Level: {nivel_riesgo}")
 
         reporte_path = None
         reporte_json = None
@@ -976,8 +1665,13 @@ class AuditoriaMejorada:
             reporte_sarif = reporter.generate_sarif()
             reporte_path = self.generar_reporte_html(output_path)
 
-            print(f"\n{ANSI_CYAN}=== REPORTES GENERADOS ==={ANSI_RESET}")
-            print(f"   📄 HTML: {reporte_path}")
-            print(f"   📊 JSON: {reporte_json}")
-            print(f"   🔧 SARIF: {reporte_sarif}")
+            print(f"\n{ANSI_CYAN}=== GENERATED REPORTS ==={ANSI_RESET}")
+            print(f"   HTML: {reporte_path}")
+            print(f"   JSON: {reporte_json}")
+            print(f"   SARIF: {reporte_sarif}")
+
+
+# English aliases for the main assessment engine class
+SecurityAuditEngine = AuditoriaMejorada
+EnhancedAudit = AuditoriaMejorada
 
