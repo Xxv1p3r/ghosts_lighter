@@ -43,11 +43,16 @@ GHOSTS LIGHTER is a local, high-performance web application security assessment 
 ### 1. Clone and Install
 
 ```bash
-git clone https://github.com/v1p3rx/ghosts-lighter.git
-cd ghosts-lighter
+git clone https://github.com/Xxv1p3r/ghosts_lighter.git
+cd ghosts_lighter
 
 # Install package dependencies and register 'ghosts-lighter' CLI:
 pip install -r requirements.txt
+
+# Note for Parrot OS / Kali / Debian environments (PEP 668):
+# pip install -r requirements.txt --break-system-packages
+# or use a virtual environment:
+# python3 -m venv venv && source venv/bin/activate && pip install -r requirements.txt
 ```
 
 ### 2. (Optional) Headless Browser Support for SPAs
@@ -120,7 +125,7 @@ ghosts-lighter http://127.0.0.1:8080 \
 ## Architecture Overview
 
 ```text
-ghosts-lighter/
+ghosts_lighter/
 ├── ghosts_lighter/
 │   ├── auth/              # Login detection and authenticated session handling
 │   │   ├── detector.py    # Heuristic discovery of login forms

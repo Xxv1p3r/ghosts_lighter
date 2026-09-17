@@ -108,7 +108,7 @@ class ReporterEngine:
                     'driver': {
                         'name': 'GHOSTS LIGHTER',
                         'version': PRODUCT_VERSION,
-                        'informationUri': 'https://github.com/v1p3rx/ghosts-lighter',
+                        'informationUri': 'https://github.com/Xxv1p3r/ghosts_lighter',
                         'rules': []
                     }
                 },
